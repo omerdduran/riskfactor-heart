@@ -606,16 +606,15 @@ def analyze_data_quality(df):
     # Analyze Age vs Heart Disease
     if 'age' in df.columns:
         print("Age vs Heart Disease:")
-        age_analysis = df.groupby(pd.cut(df['age'], bins=8))[target_col].agg(['mean', 'count'])
+        age_analysis = df.groupby(pd.cut(df['age'], bins=8), observed=True)[target_col].agg(['mean', 'count'])
         print(age_analysis)
     
     # Analyze Chest Pain vs Heart Disease
     if 'cp' in df.columns:
         print(f"\nChest Pain Type vs Heart Disease:")
-        cp_labels = {0: 'Asymptomatic', 1: 'Atypical Angina', 2: 'Non-anginal', 3: 'Typical Angina'}
-        df_temp = df.copy()
-        df_temp['cp_label'] = df_temp['cp'].map(cp_labels)
-        cp_analysis = df_temp.groupby('cp_label')[target_col].agg(['mean', 'count'])
+        print("Raw chest pain values:", df['cp'].value_counts().head())
+        # Use actual values since this dataset uses string categories
+        cp_analysis = df.groupby('cp')[target_col].agg(['mean', 'count'])
         print(cp_analysis)
     
     # Analyze Cholesterol vs Heart Disease
@@ -624,14 +623,14 @@ def analyze_data_quality(df):
         # Exclude zero values (missing data)
         chol_data = df[df['chol'] > 0]
         if len(chol_data) > 0:
-            chol_analysis = chol_data.groupby(pd.cut(chol_data['chol'], bins=5))[target_col].agg(['mean', 'count'])
+            chol_analysis = chol_data.groupby(pd.cut(chol_data['chol'], bins=5), observed=True)[target_col].agg(['mean', 'count'])
             print(chol_analysis)
         print(f"Zero cholesterol values (missing): {(df['chol'] == 0).sum()}")
     
     # Analyze Max Heart Rate vs Heart Disease
     if 'thalach' in df.columns:
         print(f"\nMax Heart Rate vs Heart Disease:")
-        hr_analysis = df.groupby(pd.cut(df['thalach'], bins=5))[target_col].agg(['mean', 'count'])
+        hr_analysis = df.groupby(pd.cut(df['thalach'], bins=5), observed=True)[target_col].agg(['mean', 'count'])
         print(hr_analysis)
     
     # Key clinical correlations
