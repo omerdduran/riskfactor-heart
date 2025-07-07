@@ -147,6 +147,13 @@ def preprocess_data(df):
             print(f"Removed non-predictive column: {col}")
     
     # HANDLE MISSING VALUES FIRST
+    # Fix cholesterol zero values (medical impossibility - treat as missing)
+    if 'chol' in df_processed.columns:
+        zero_chol_count = (df_processed['chol'] == 0).sum()
+        if zero_chol_count > 0:
+            print(f"Converting {zero_chol_count} zero cholesterol values to missing (medically impossible)")
+            df_processed.loc[df_processed['chol'] == 0, 'chol'] = np.nan
+    
     print("Handling missing values...")
     
     # Show missing value summary
@@ -215,9 +222,10 @@ def preprocess_data(df):
     
     # Cholesterol Risk Levels (mg/dl medical thresholds)
     if 'chol' in df_processed.columns:
-        df_processed['high_cholesterol'] = (df_processed['chol'] >= 240).astype(int)
-        df_processed['borderline_cholesterol'] = ((df_processed['chol'] >= 200) & (df_processed['chol'] < 240)).astype(int)
-        print("Cholesterol risk levels created")
+        # Handle NaN values in cholesterol features
+        df_processed['high_cholesterol'] = (df_processed['chol'] >= 240).fillna(0).astype(int)
+        df_processed['borderline_cholesterol'] = ((df_processed['chol'] >= 200) & (df_processed['chol'] < 240)).fillna(0).astype(int)
+        print("Cholesterol risk levels created (NaN treated as normal)")
     
     # Maximum Heart Rate Categories (use correct column name)
     if 'thalch' in df_processed.columns:
