@@ -182,11 +182,18 @@ def preprocess_data(df):
         categorical_imputer = SimpleImputer(strategy='most_frequent')
         df_processed[categorical_cols_with_missing] = categorical_imputer.fit_transform(df_processed[categorical_cols_with_missing])
     
-    # Handle 'ca' (number of vessels) - treat as ordinal
+    # Handle 'ca' (number of vessels) - improved imputation
     if 'ca' in df_processed.columns:
         df_processed['ca'] = df_processed['ca'].astype(float)
         if df_processed['ca'].isnull().sum() > 0:
-            df_processed['ca'].fillna(0, inplace=True)  # 0 vessels is meaningful
+            # Smart imputation: high-risk patients more likely to have blocked vessels
+            if 'exang' in df_processed.columns and 'oldpeak' in df_processed.columns:
+                high_risk_mask = (df_processed['exang'] == True) & (df_processed['oldpeak'] > 1.0)
+                df_processed.loc[df_processed['ca'].isnull() & high_risk_mask, 'ca'] = 1.0
+                df_processed.loc[df_processed['ca'].isnull() & ~high_risk_mask, 'ca'] = 0.0
+            else:
+                df_processed['ca'].fillna(0, inplace=True)
+            print("Improved ca (vessels) imputation")
     
     print("Missing value handling completed")
     
@@ -227,19 +234,14 @@ def preprocess_data(df):
         df_processed['mild_st_depression'] = ((df_processed['oldpeak'] >= 1.0) & (df_processed['oldpeak'] < 2.0)).astype(int)
         print("ST depression features created")
     
-    # Chest Pain Severity Score
+    # Chest Pain Binary Features (more interpretable than risk scores)
     if 'cp' in df_processed.columns:
-        # Map chest pain types to risk scores (asymptomatic = highest risk)
-        cp_mapping = {
-            'asymptomatic': 3,
-            'atypical angina': 2, 
-            'non-anginal': 1,
-            'typical angina': 0
-        }
-        df_processed['cp_risk_score'] = df_processed['cp'].map(cp_mapping)
-        if df_processed['cp_risk_score'].isnull().sum() > 0:
-            df_processed['cp_risk_score'].fillna(1, inplace=True)  # Default to medium risk
-        print("Chest pain risk score created")
+        # Create binary indicators instead of risk scores to avoid model confusion
+        print("Creating chest pain binary features...")
+        
+        # Create high-risk indicator (asymptomatic patients have highest risk)
+        df_processed['cp_high_risk'] = (df_processed['cp'] == 'asymptomatic').astype(int)
+        print("Chest pain high-risk indicator created")
     
     # Major Vessels Blocked (ca)
     if 'ca' in df_processed.columns:
@@ -252,9 +254,9 @@ def preprocess_data(df):
     binary_risk_features = ['fbs', 'exang']  # fasting blood sugar, exercise angina
     available_binary_risk = [col for col in binary_risk_features if col in df_processed.columns]
     
-    # Add our engineered high-risk features
+    # Add our engineered high-risk features (updated to include chest pain)
     engineered_risk_features = ['age_high_risk', 'hypertension_stage2', 'high_cholesterol', 
-                               'low_heart_rate_reserve', 'significant_st_depression', 'multiple_vessel_disease']
+                               'low_heart_rate_reserve', 'significant_st_depression', 'multiple_vessel_disease', 'cp_high_risk']
     available_engineered_risk = [col for col in engineered_risk_features if col in df_processed.columns]
     
     all_risk_factors = available_binary_risk + available_engineered_risk
