@@ -4,24 +4,44 @@ Objective: Implement logistic regression to predict heart disease using the vali
 and document the ML process step-by-step.
 """
 
-import pandas as pd
+import os
+import json
+import logging
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer, make_column_selector as selector
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegressionCV
 from sklearn.metrics import (
-    accuracy_score, 
-    precision_score, 
-    recall_score, 
-    f1_score, 
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
     confusion_matrix,
-    classification_report
+    roc_auc_score,
+    average_precision_score,
+    brier_score_loss,
+    roc_curve,
 )
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
 import kagglehub
-import os
+import joblib
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 
 def download_dataset():
     """
@@ -30,27 +50,26 @@ def download_dataset():
     Why: Need real-world medical data with validated clinical relationships
     How: Using kagglehub to download the validated UCI heart disease dataset
     """
-    print("STEP 1: DATASET DOWNLOAD")
-    print("-" * 40)
+    logger.info("STEP 1: DATASET DOWNLOAD")
     
     try:
         # Download the Cleveland Heart Disease dataset (much better than synthetic data)
         path = kagglehub.dataset_download("redwankarimsony/heart-disease-data")
-        print("Dataset downloaded successfully!")
-        print(f"Path: {path}")
+        logger.info("Dataset downloaded successfully!")
+        logger.info(f"Path: {path}")
         
         # Find the CSV file
         csv_files = [f for f in os.listdir(path) if f.endswith('.csv')]
         if csv_files:
             dataset_path = os.path.join(path, csv_files[0])
-            print(f"Found dataset file: {csv_files[0]}")
+            logger.info(f"Found dataset file: {csv_files[0]}")
             return dataset_path
         else:
-            print("ERROR: No CSV file found in downloaded dataset")
+            logger.error("No CSV file found in downloaded dataset")
             return None
             
     except Exception as e:
-        print(f"ERROR downloading dataset: {e}")
+        logger.exception(f"ERROR downloading dataset: {e}")
         return None
 
 def explore_dataset(df):
@@ -60,20 +79,19 @@ def explore_dataset(df):
     Why: Understanding data helps in proper preprocessing and feature selection
     How: Using pandas methods to analyze shape, types, distributions, and missing values
     """
-    print("\nSTEP 2: DATASET EXPLORATION")
-    print("-" * 40)
+    logger.info("STEP 2: DATASET EXPLORATION")
     
-    print(f"Dataset Shape: {df.shape}")
-    print(f"Features: {df.shape[1]} columns, {df.shape[0]} rows")
+    logger.info(f"Dataset Shape: {df.shape}")
+    logger.info(f"Features: {df.shape[1]} columns, {df.shape[0]} rows")
     
-    print("\nMissing Values:")
+    logger.info("Missing Values:")
     missing_values = df.isnull().sum()
     if missing_values.sum() > 0:
-        print(missing_values[missing_values > 0])
+        logger.info("\n" + str(missing_values[missing_values > 0]))
     else:
-        print("No missing values found!")
+        logger.info("No missing values found!")
     
-    print("\nTarget Variable Distribution:")
+    logger.info("Target Variable Distribution:")
     # Cleveland dataset uses 'num' as target (0 = no disease, 1-4 = disease presence)
     target_column = None
     if 'num' in df.columns:
@@ -88,329 +106,214 @@ def explore_dataset(df):
     
     if target_column:
         target_counts = df[target_column].value_counts()
-        print(f"Target column: {target_column}")
-        print(target_counts)
-        print(f"Class Balance: {target_counts[1]/len(df)*100:.1f}% positive cases")
+        logger.info(f"Target column: {target_column}")
+        logger.info("\n" + str(target_counts))
+        logger.info(f"Class Balance: {target_counts[1]/len(df)*100:.1f}% positive cases")
         
         # Show original 'num' distribution if available
         if 'num' in df.columns and target_column != 'num':
-            print(f"\nOriginal 'num' distribution (0=no disease, 1-4=disease severity):")
-            print(df['num'].value_counts().sort_index())
+            logger.info("Original 'num' distribution (0=no disease, 1-4=disease severity):")
+            logger.info("\n" + str(df['num'].value_counts().sort_index()))
     else:
-        print("Target variable not found!")
+        logger.warning("Target variable not found!")
     
-    print("\nColumn Information:")
-    print("Available columns:", list(df.columns))
+    logger.info("Column Information:")
+    logger.info(f"Available columns: {list(df.columns)}")
     
-    print(f"\nData Types:")
-    print(f"Categorical: {len(df.select_dtypes(include=['object']).columns)}")
-    print(f"Numerical: {len(df.select_dtypes(include=['int64', 'float64']).columns)}")
+    logger.info("Data Types:")
+    logger.info(f"Categorical: {len(df.select_dtypes(include=['object']).columns)}")
+    logger.info(f"Numerical: {len(df.select_dtypes(include=['int64', 'float64']).columns)}")
     
     # Show some sample data
-    print(f"\nSample data (first 5 rows):")
-    print(df.head())
+    logger.info("Sample data (first 5 rows):\n" + str(df.head()))
     
     return df
 
-def preprocess_data(df):
+class MedicalFeatureEngineer(BaseEstimator, TransformerMixin):
+    """Custom transformer to create medically meaningful features.
+
+    Note: This transformer must not use target information; it should
+    only derive features from X to avoid leakage.
     """
-    Step 3: Data Preprocessing and Feature Engineering
-    What: Prepare Cleveland Heart Disease data for machine learning model training
-    Why: Raw data needs cleaning and transformation for optimal model performance
-    How: Handle categorical variables, missing values, create medical features, and prepare X, y splits
-    """
-    print("\nSTEP 3: DATA PREPROCESSING")
-    print("-" * 40)
-    
-    # Make a copy to avoid modifying original data
+
+    def fit(self, X, y=None):
+        # Stateless transformer
+        return self
+
+    def transform(self, X):
+        X_out = X.copy()
+
+        # Normalize dtypes early for consistency
+        if 'chol' in X_out.columns:
+            # Treat zero cholesterol as missing
+            with np.errstate(invalid='ignore'):
+                zero_chol_count = (X_out['chol'] == 0).sum()
+            if zero_chol_count > 0:
+                logger.debug(f"Converting {int(zero_chol_count)} zero cholesterol values to NaN")
+                X_out.loc[X_out['chol'] == 0, 'chol'] = np.nan
+
+        # Age risk groups
+        if 'age' in X_out.columns:
+            X_out['age_high_risk'] = (X_out['age'] >= 65).astype(int)
+            X_out['age_medium_risk'] = ((X_out['age'] >= 45) & (X_out['age'] < 65)).astype(int)
+
+        # Blood pressure categories
+        if 'trestbps' in X_out.columns:
+            X_out['hypertension_stage1'] = ((X_out['trestbps'] >= 130) & (X_out['trestbps'] < 140)).astype(int)
+            X_out['hypertension_stage2'] = (X_out['trestbps'] >= 140).astype(int)
+            X_out['hypotension'] = (X_out['trestbps'] < 90).astype(int)
+
+        # Cholesterol categories
+        if 'chol' in X_out.columns:
+            X_out['high_cholesterol'] = (X_out['chol'] >= 240).fillna(0).astype(int)
+            X_out['borderline_cholesterol'] = ((X_out['chol'] >= 200) & (X_out['chol'] < 240)).fillna(0).astype(int)
+
+        # Heart rate derived features
+        if 'thalch' in X_out.columns:
+            if 'age' in X_out.columns:
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    X_out['heart_rate_reserve'] = X_out['thalch'] / (220 - X_out['age'])
+            X_out['low_heart_rate_reserve'] = (X_out.get('heart_rate_reserve', 1.0) < 0.6).astype(int)
+            X_out['low_max_heart_rate'] = (X_out['thalch'] < 120).astype(int)
+
+        # ST depression
+        if 'oldpeak' in X_out.columns:
+            X_out['significant_st_depression'] = (X_out['oldpeak'] >= 2.0).astype(int)
+            X_out['mild_st_depression'] = ((X_out['oldpeak'] >= 1.0) & (X_out['oldpeak'] < 2.0)).astype(int)
+
+        # Chest pain (string categories in some variants)
+        if 'cp' in X_out.columns:
+            # normalize to lowercase strings if not numeric
+            if not np.issubdtype(X_out['cp'].dtype, np.number):
+                cp_lower = X_out['cp'].astype(str).str.lower()
+                X_out['cp_high_risk'] = (cp_lower == 'asymptomatic').astype(int)
+            else:
+                # If numeric (0-3), map 0: typical angina, 3: asymptomatic (UCI conv.)
+                X_out['cp_high_risk'] = (X_out['cp'] == 3).astype(int)
+
+        # Vessel disease
+        if 'ca' in X_out.columns:
+            with np.errstate(invalid='ignore'):
+                X_out['multiple_vessel_disease'] = (X_out['ca'] >= 2).astype(int)
+                X_out['single_vessel_disease'] = (X_out['ca'] == 1).astype(int)
+
+        # Binary risk features from raw columns (ensure 0/1 ints)
+        for col in ['fbs', 'exang']:
+            if col in X_out.columns:
+                if X_out[col].dtype == bool:
+                    X_out[col] = X_out[col].astype(int)
+                else:
+                    # attempt to coerce to int 0/1 safely
+                    X_out[col] = pd.to_numeric(X_out[col], errors='coerce').fillna(0).astype(int)
+
+        # Composite score
+        candidates = [
+            c for c in [
+                'fbs', 'exang', 'age_high_risk', 'hypertension_stage2', 'high_cholesterol',
+                'low_heart_rate_reserve', 'significant_st_depression', 'multiple_vessel_disease', 'cp_high_risk'
+            ] if c in X_out.columns
+        ]
+        if candidates:
+            X_out['total_risk_score'] = X_out[candidates].sum(axis=1)
+            X_out['high_risk_patient'] = (X_out['total_risk_score'] >= 3).astype(int)
+
+        return X_out
+
+
+def prepare_features_and_target(df):
+    """Prepare X and y without applying any imputation/encoding to avoid leakage."""
+    logger.info("STEP 3: DATA PREPARATION (no-leakage)")
+
     df_processed = df.copy()
-    
-    # Identify the target variable (should be 'target' from explore step)
-    target_column = None
+
+    # Determine target column
     if 'target' in df_processed.columns:
         target_column = 'target'
     elif 'num' in df_processed.columns:
-        # Convert multi-class to binary if not done already
         df_processed['target'] = (df_processed['num'] > 0).astype(int)
         target_column = 'target'
     else:
-        print("ERROR: Cannot find target variable")
-        return None, None, None
-    
-    print(f"Target variable: {target_column}")
-    
-    # Remove non-predictive columns
-    columns_to_remove = ['id', 'origin', 'num', 'dataset']  # Keep original num out of features
-    for col in columns_to_remove:
-        if col in df_processed.columns:
-            df_processed = df_processed.drop(col, axis=1)
-            print(f"Removed non-predictive column: {col}")
-    
-    # HANDLE MISSING VALUES FIRST
-    # Fix cholesterol zero values (medical impossibility - treat as missing)
-    if 'chol' in df_processed.columns:
-        zero_chol_count = (df_processed['chol'] == 0).sum()
-        if zero_chol_count > 0:
-            print(f"Converting {zero_chol_count} zero cholesterol values to missing (medically impossible)")
-            df_processed.loc[df_processed['chol'] == 0, 'chol'] = np.nan
-    
-    print("Handling missing values...")
-    
-    # Show missing value summary
-    missing_summary = df_processed.isnull().sum()
-    missing_cols = missing_summary[missing_summary > 0]
-    if len(missing_cols) > 0:
-        print("Missing values found:")
-        for col, count in missing_cols.items():
-            pct = (count / len(df_processed)) * 100
-            print(f"  {col}: {count} ({pct:.1f}%)")
-    
-    # Handle missing values strategically
-    # For numeric columns with missing values
-    numeric_cols_with_missing = []
-    for col in ['trestbps', 'chol', 'thalch', 'oldpeak']:
-        if col in df_processed.columns and df_processed[col].isnull().sum() > 0:
-            numeric_cols_with_missing.append(col)
-    
-    if numeric_cols_with_missing:
-        print(f"Imputing numeric columns: {numeric_cols_with_missing}")
-        numeric_imputer = SimpleImputer(strategy='median')
-        df_processed[numeric_cols_with_missing] = numeric_imputer.fit_transform(df_processed[numeric_cols_with_missing])
-    
-    # For categorical columns with missing values
-    categorical_cols_with_missing = []
-    for col in ['fbs', 'restecg', 'exang', 'slope', 'ca', 'thal']:
-        if col in df_processed.columns and df_processed[col].isnull().sum() > 0:
-            categorical_cols_with_missing.append(col)
-    
-    if categorical_cols_with_missing:
-        print(f"Imputing categorical columns: {categorical_cols_with_missing}")
-        # Use most frequent for categorical
-        categorical_imputer = SimpleImputer(strategy='most_frequent')
-        df_processed[categorical_cols_with_missing] = categorical_imputer.fit_transform(df_processed[categorical_cols_with_missing])
-    
-    # Handle 'ca' (number of vessels) - improved imputation
-    if 'ca' in df_processed.columns:
-        df_processed['ca'] = df_processed['ca'].astype(float)
-        if df_processed['ca'].isnull().sum() > 0:
-            # Smart imputation: high-risk patients more likely to have blocked vessels
-            if 'exang' in df_processed.columns and 'oldpeak' in df_processed.columns:
-                high_risk_mask = (df_processed['exang'] == True) & (df_processed['oldpeak'] > 1.0)
-                df_processed.loc[df_processed['ca'].isnull() & high_risk_mask, 'ca'] = 1.0
-                df_processed.loc[df_processed['ca'].isnull() & ~high_risk_mask, 'ca'] = 0.0
-            else:
-                df_processed['ca'].fillna(0, inplace=True)
-            print("Improved ca (vessels) imputation")
-    
-    print("Missing value handling completed")
-    
-    # CLEVELAND DATASET SPECIFIC FEATURE ENGINEERING
-    print("Creating Cleveland-specific medical features...")
-    
-    # Age Risk Groups (medically validated thresholds)
-    if 'age' in df_processed.columns:
-        df_processed['age_high_risk'] = (df_processed['age'] >= 65).astype(int)
-        df_processed['age_medium_risk'] = ((df_processed['age'] >= 45) & (df_processed['age'] < 65)).astype(int)
-        print("Age risk groups created")
-    
-    # Resting Blood Pressure Categories
-    if 'trestbps' in df_processed.columns:
-        df_processed['hypertension_stage1'] = ((df_processed['trestbps'] >= 130) & (df_processed['trestbps'] < 140)).astype(int)
-        df_processed['hypertension_stage2'] = (df_processed['trestbps'] >= 140).astype(int)
-        df_processed['hypotension'] = (df_processed['trestbps'] < 90).astype(int)
-        print("Blood pressure categories created")
-    
-    # Cholesterol Risk Levels (mg/dl medical thresholds)
-    if 'chol' in df_processed.columns:
-        # Handle NaN values in cholesterol features
-        df_processed['high_cholesterol'] = (df_processed['chol'] >= 240).fillna(0).astype(int)
-        df_processed['borderline_cholesterol'] = ((df_processed['chol'] >= 200) & (df_processed['chol'] < 240)).fillna(0).astype(int)
-        print("Cholesterol risk levels created (NaN treated as normal)")
-    
-    # Maximum Heart Rate Categories (use correct column name)
-    if 'thalch' in df_processed.columns:
-        # Age-adjusted max heart rate (220 - age is theoretical max)
-        if 'age' in df_processed.columns:
-            df_processed['heart_rate_reserve'] = df_processed['thalch'] / (220 - df_processed['age'])
-            df_processed['low_heart_rate_reserve'] = (df_processed['heart_rate_reserve'] < 0.6).astype(int)
-        df_processed['low_max_heart_rate'] = (df_processed['thalch'] < 120).astype(int)
-        print("Heart rate features created")
-    
-    # ST Depression Risk (oldpeak)
-    if 'oldpeak' in df_processed.columns:
-        df_processed['significant_st_depression'] = (df_processed['oldpeak'] >= 2.0).astype(int)
-        df_processed['mild_st_depression'] = ((df_processed['oldpeak'] >= 1.0) & (df_processed['oldpeak'] < 2.0)).astype(int)
-        print("ST depression features created")
-    
-    # Chest Pain Binary Features (more interpretable than risk scores)
-    if 'cp' in df_processed.columns:
-        # Create binary indicators instead of risk scores to avoid model confusion
-        print("Creating chest pain binary features...")
-        
-        # Create high-risk indicator (asymptomatic patients have highest risk)
-        df_processed['cp_high_risk'] = (df_processed['cp'] == 'asymptomatic').astype(int)
-        print("Chest pain high-risk indicator created")
-    
-    # Major Vessels Blocked (ca)
-    if 'ca' in df_processed.columns:
-        df_processed['multiple_vessel_disease'] = (df_processed['ca'] >= 2).astype(int)
-        df_processed['single_vessel_disease'] = (df_processed['ca'] == 1).astype(int)
-        print("Vessel disease features created")
-    
-    # Composite Risk Scores
-    # High-risk binary features
-    binary_risk_features = ['fbs', 'exang']  # fasting blood sugar, exercise angina
-    available_binary_risk = [col for col in binary_risk_features if col in df_processed.columns]
-    
-    # Add our engineered high-risk features (updated to include chest pain)
-    engineered_risk_features = ['age_high_risk', 'hypertension_stage2', 'high_cholesterol', 
-                               'low_heart_rate_reserve', 'significant_st_depression', 'multiple_vessel_disease', 'cp_high_risk']
-    available_engineered_risk = [col for col in engineered_risk_features if col in df_processed.columns]
-    
-    all_risk_factors = available_binary_risk + available_engineered_risk
-    if all_risk_factors:
-        df_processed['total_risk_score'] = df_processed[all_risk_factors].sum(axis=1)
-        df_processed['high_risk_patient'] = (df_processed['total_risk_score'] >= 3).astype(int)
-        print(f"Composite risk score created from: {all_risk_factors}")
-    
-    # Handle categorical variables
-    categorical_cols = df_processed.select_dtypes(include=['object']).columns.tolist()
-    
-    # Remove target from categorical cols if present
-    if target_column in categorical_cols:
-        categorical_cols.remove(target_column)
-    
-    print(f"Categorical columns for encoding: {categorical_cols}")
-    
-    # Handle remaining categorical variables with one-hot encoding
-    if categorical_cols:
-        print("Applying One-Hot Encoding to categorical variables...")
-        df_processed = pd.get_dummies(df_processed, columns=categorical_cols, drop_first=True)
-        print(f"Shape after encoding: {df_processed.shape}")
-    
-    # Final check for any remaining missing values
-    final_missing = df_processed.isnull().sum().sum()
-    if final_missing > 0:
-        print(f"WARNING: {final_missing} missing values remain!")
-        # Drop rows with remaining missing values as last resort
-        df_processed = df_processed.dropna()
-        print(f"Dropped rows with missing values. New shape: {df_processed.shape}")
-    
-    # Prepare features (X) and target (y)
+        logger.error("Cannot find target variable ('target' or 'num')")
+        return None, None
+
+    # Drop non-predictive / leakage-prone columns
+    columns_to_remove = ['id', 'origin', 'num', 'dataset']
+    existing_to_drop = [c for c in columns_to_remove if c in df_processed.columns]
+    if existing_to_drop:
+        logger.info(f"Dropping non-predictive columns: {existing_to_drop}")
+        df_processed = df_processed.drop(existing_to_drop, axis=1)
+
+    y = df_processed[target_column].astype(int)
     X = df_processed.drop(target_column, axis=1)
-    y = df_processed[target_column]
-    
-    print(f"Final preprocessing results:")
-    print(f"  Features (X): {X.shape}")
-    print(f"  Target (y): {y.shape}")
-    print(f"  Target distribution: {y.value_counts().to_dict()}")
-    
-    # Show the engineered features
-    engineered_features = [col for col in X.columns if any(keyword in col for keyword in 
-                          ['_risk', '_score', 'hypertension', 'cholesterol', 'heart_rate', 'st_depression', 
-                           'vessel', 'high_', 'low_', 'borderline_', 'significant_'])]
-    if engineered_features:
-        print(f"Engineered medical features: {engineered_features}")
-    
-    return X, y, df_processed
 
-def split_and_scale_data(X, y):
-    """
-    Step 4: Train-Test Split and Feature Scaling
-    What: Split data into training and testing sets, then scale features
-    Why: Need separate test set for unbiased evaluation, scaling ensures all features contribute equally
-    How: Stratified split to maintain class balance, StandardScaler for normalization
-    """
-    print("\nSTEP 4: TRAIN-TEST SPLIT & SCALING")
-    print("-" * 40)
-    
-    # Stratified train-test split
+    logger.info(f"Features shape: {X.shape} | Target shape: {y.shape}")
+    return X, y
+
+def split_data(X, y, test_size=0.2, seed=42):
+    """Stratified train-test split only (no scaling)."""
+    logger.info("STEP 4: TRAIN-TEST SPLIT")
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, 
-        test_size=0.2, 
-        stratify=y, 
-        random_state=42
+        X, y, test_size=test_size, stratify=y, random_state=seed
     )
-    
-    print(f"Training set: {X_train.shape[0]} samples")
-    print(f"Test set: {X_test.shape[0]} samples")
-    
-    # Feature scaling
-    print("Applying StandardScaler...")
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    
-    print("Feature scaling completed")
-    
-    return X_train_scaled, X_test_scaled, y_train, y_test, scaler
+    logger.info(f"Training set: {X_train.shape[0]} | Test set: {X_test.shape[0]}")
+    return X_train, X_test, y_train, y_test
 
-def train_logistic_regression(X_train, y_train):
-    """
-    Step 5: Logistic Regression Model Training
-    What: Train logistic regression model on the prepared training data
-    Why: Logistic regression is ideal for binary classification and provides interpretable results
-    How: Using scikit-learn's LogisticRegression with optimized parameters and cross-validation
-    """
-    print("\nSTEP 5: LOGISTIC REGRESSION TRAINING")
-    print("-" * 40)
-    
-    # Calculate class distribution for information
-    class_counts = pd.Series(y_train).value_counts()
-    class_ratio = class_counts[0] / class_counts[1] if 1 in class_counts else 1
-    print(f"Training class distribution: {class_counts.to_dict()}")
-    print(f"Class imbalance ratio (neg/pos): {class_ratio:.2f}")
-    
-    # FIXED: Optimized model configuration for better performance
-    
-    # Try different regularization strengths
-    C_values = [0.1, 0.5, 1.0, 2.0, 5.0]
-    best_score = 0
-    best_C = 1.0
-    
-    print("Finding optimal regularization parameter...")
-    for C in C_values:
-        model_temp = LogisticRegression(
-            solver='lbfgs',  # Better solver for small datasets
-            C=C,
-            class_weight='balanced',
-            random_state=42,
-            max_iter=1000
-        )
-        
-        # 5-fold cross validation
-        cv_scores = cross_val_score(model_temp, X_train, y_train, cv=5, scoring='f1')
-        avg_score = cv_scores.mean()
-        
-        print(f"  C={C}: F1-Score = {avg_score:.3f} (±{cv_scores.std():.3f})")
-        
-        if avg_score > best_score:
-            best_score = avg_score
-            best_C = C
-    
-    print(f"Best C value: {best_C} with F1-Score: {best_score:.3f}")
-    
-    # Train final model with best parameters
-    model = LogisticRegression(
-        solver='lbfgs',
-        C=best_C,
-        class_weight='balanced',
-        random_state=42,
-        max_iter=1000
+def build_and_train_pipeline(X_train, y_train):
+    """Build a leakage-free Pipeline with ColumnTransformer and train with LR-CV."""
+    logger.info("STEP 5: MODELING (Pipeline + LogisticRegressionCV)")
+
+    # Preprocessor: numeric and categorical branches
+    numeric_processor = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+
+    categorical_processor = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("ohe", OneHotEncoder(handle_unknown="ignore", drop="first")),
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_processor, selector(dtype_include=np.number)),
+            ("cat", categorical_processor, selector(dtype_include=object)),
+        ],
+        remainder="drop",
     )
-    
-    print("\nModel Configuration:")
-    print(f"  Solver: {model.solver}")
-    print(f"  Regularization (C): {model.C}")
-    print(f"  Class weight: {model.class_weight}")
-    print(f"  Max iterations: {model.max_iter}")
-    
-    print("\nTraining final model...")
-    model.fit(X_train, y_train)
-    
-    print("Model training completed!")
-    
-    return model
+
+    # Logistic Regression with cross-validated C selection
+    clf = LogisticRegressionCV(
+        Cs=[0.1, 0.5, 1.0, 2.0, 5.0],
+        cv=5,
+        scoring="f1",
+        class_weight="balanced",
+        solver="lbfgs",
+        max_iter=1000,
+        n_jobs=None,
+        refit=True,
+    )
+
+    pipeline = Pipeline(steps=[
+        ("feature_engineering", MedicalFeatureEngineer()),
+        ("preprocessor", preprocessor),
+        ("clf", clf),
+    ])
+
+    class_counts = pd.Series(y_train).value_counts().to_dict()
+    neg = class_counts.get(0, 0)
+    pos = class_counts.get(1, 0)
+    ratio = (neg / pos) if pos else float('inf')
+    logger.info(f"Training class distribution: {class_counts} | Neg/Pos ratio: {ratio:.2f}")
+
+    logger.info("Fitting pipeline...")
+    pipeline.fit(X_train, y_train)
+    logger.info("Model training completed")
+
+    # Best C from LogisticRegressionCV
+    best_C = float(np.ravel(pipeline.named_steps['clf'].C_)[0])
+    logger.info(f"Best regularization C selected by CV: {best_C}")
+
+    return pipeline, best_C
 
 def make_predictions(model, X_test):
     """
@@ -419,16 +322,15 @@ def make_predictions(model, X_test):
     Why: Need predictions to evaluate model performance
     How: Generate both binary predictions and probability scores
     """
-    print("\nSTEP 6: PREDICTION GENERATION")
-    print("-" * 40)
+    logger.info("STEP 6: PREDICTION GENERATION")
     
     # Generate predictions
     y_pred = model.predict(X_test)
     y_pred_proba = model.predict_proba(X_test)[:, 1]
-    
-    print(f"Predictions generated for {len(y_pred)} samples")
-    print(f"Predicted positive cases: {sum(y_pred)}")
-    print(f"Average predicted probability: {y_pred_proba.mean():.3f}")
+
+    logger.info(f"Predictions generated for {len(y_pred)} samples")
+    logger.info(f"Predicted positive cases: {int(np.sum(y_pred))}")
+    logger.info(f"Average predicted probability: {y_pred_proba.mean():.3f}")
     
     return y_pred, y_pred_proba
 
@@ -439,131 +341,87 @@ def evaluate_model(y_test, y_pred, y_pred_proba):
     Why: Need multiple metrics to understand model strengths and weaknesses
     How: Calculate accuracy, precision, recall, F1-score, and create confusion matrix
     """
-    print("\nSTEP 7: MODEL EVALUATION")
-    print("-" * 40)
+    logger.info("STEP 7: MODEL EVALUATION")
     
     # Calculate metrics
     accuracy = accuracy_score(y_test, y_pred)
     precision = precision_score(y_test, y_pred)
     recall = recall_score(y_test, y_pred)
     f1 = f1_score(y_test, y_pred)
-    
-    print("PERFORMANCE METRICS:")
-    print(f"  Accuracy:  {accuracy:.3f} ({accuracy*100:.1f}%)")
-    print(f"  Precision: {precision:.3f}")
-    print(f"  Recall:    {recall:.3f}")
-    print(f"  F1-Score:  {f1:.3f}")
-    
+
+    # Additional metrics (Quick Wins)
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    pr_auc = average_precision_score(y_test, y_pred_proba)
+    brier = brier_score_loss(y_test, y_pred_proba)
+
+    logger.info("PERFORMANCE METRICS:")
+    logger.info(f"  Accuracy:  {accuracy:.3f} ({accuracy*100:.1f}%)")
+    logger.info(f"  Precision: {precision:.3f}")
+    logger.info(f"  Recall:    {recall:.3f}")
+    logger.info(f"  F1-Score:  {f1:.3f}")
+    logger.info(f"  ROC-AUC:   {roc_auc:.3f}")
+    logger.info(f"  PR-AUC:    {pr_auc:.3f}")
+    logger.info(f"  Brier:     {brier:.3f}")
+
     # Confusion Matrix
     cm = confusion_matrix(y_test, y_pred)
-    print(f"\nCONFUSION MATRIX:")
-    print(f"              Predicted")
-    print(f"            0      1")
-    print(f"Actual  0  {cm[0,0]:3d}   {cm[0,1]:3d}")
-    print(f"        1  {cm[1,0]:3d}   {cm[1,1]:3d}")
-    
-    return accuracy, precision, recall, f1, cm
+    logger.info("Confusion matrix computed")
 
-def analyze_feature_importance(model, feature_names):
+    return accuracy, precision, recall, f1, cm, {"roc_auc": roc_auc, "pr_auc": pr_auc, "brier": brier}
+
+def analyze_feature_importance(model, X_fit_columns):
     """
     Step 8: Feature Importance and Model Interpretation
     What: Analyze and interpret the trained model coefficients
     Why: Understanding which features drive predictions helps validate model and guide medical decisions
     How: Extract and rank logistic regression coefficients with medical interpretation
     """
-    print("\nSTEP 8: FEATURE IMPORTANCE ANALYSIS")
-    print("-" * 40)
-    
-    # Get model coefficients
-    coefficients = model.coef_[0]
-    intercept = model.intercept_[0]
-    
-    print(f"Model Intercept: {intercept:.4f}")
-    print(f"Number of features: {len(coefficients)}")
-    
-    # Create feature importance dataframe
+def analyze_feature_importance(pipeline, X_sample):
+    """Extract feature names from preprocessor and align with coefficients."""
+    logger.info("STEP 8: FEATURE IMPORTANCE ANALYSIS")
+
+    clf = pipeline.named_steps['clf']
+    pre = pipeline.named_steps['preprocessor']
+    # Get names after preprocessing
+    try:
+        feature_names = pre.get_feature_names_out()
+    except Exception:
+        # Fallback: generate generic names
+        feature_names = np.array([f"f_{i}" for i in range(clf.coef_.shape[1])])
+
+    coefficients = clf.coef_[0]
+    intercept = float(clf.intercept_[0])
+    logger.info(f"Model Intercept: {intercept:.4f} | Features: {len(coefficients)}")
+
     feature_importance = pd.DataFrame({
         'feature': feature_names,
         'coefficient': coefficients,
         'abs_coefficient': np.abs(coefficients),
-        'odds_ratio': np.exp(coefficients)  # Convert to odds ratios for medical interpretation
+        'odds_ratio': np.exp(coefficients)
     }).sort_values('abs_coefficient', ascending=False)
-    
-    print(f"\nTOP 15 MOST IMPORTANT FEATURES:")
-    print("-" * 70)
-    print(f"{'Feature':30s} {'Coefficient':>12s} {'Odds Ratio':>12s} {'Impact':>12s}")
-    print("-" * 70)
-    
-    for i, row in feature_importance.head(15).iterrows():
-        direction = "Increases" if row['coefficient'] > 0 else "Decreases"
-        odds_ratio = row['odds_ratio']
-        
-        # Interpret odds ratio
-        if odds_ratio > 1:
-            odds_interpretation = f"{odds_ratio:.2f}x risk"
-        else:
-            odds_interpretation = f"{1/odds_ratio:.2f}x protect"
-            
-        print(f"{row['feature']:30s} {row['coefficient']:>10.3f}   {odds_ratio:>10.3f}   {direction:>10s}")
-    
-    print(f"\n" + "=" * 70)
-    print("MEDICAL INTERPRETATION:")
-    print("=" * 70)
-    
-    # Group features by medical category for better interpretation
-    categories = {
-        'cardiovascular': ['trestbps', 'thalach', 'heart_rate', 'hypertension', 'hypotension'],
-        'cardiac_function': ['oldpeak', 'st_depression', 'slope', 'exang'],
-        'metabolic': ['chol', 'cholesterol', 'fbs'],
-        'vascular': ['ca', 'vessel', 'thal'],
-        'symptoms': ['cp', 'chest_pain', 'angina'],
-        'demographic': ['age', 'sex'],
-        'engineered': ['_risk', '_score', 'total_risk', 'high_risk_patient']
-    }
-    
-    for category, keywords in categories.items():
-        relevant_features = []
-        for feature in feature_importance.head(10)['feature']:
-            if any(keyword.lower().replace(' ', '_') in feature.lower() for keyword in keywords):
-                relevant_features.append(feature)
-        
-        if relevant_features:
-            print(f"\n{category.upper()} FACTORS:")
-            for feature in relevant_features:
-                row = feature_importance[feature_importance['feature'] == feature].iloc[0]
-                direction = "increases" if row['coefficient'] > 0 else "decreases"
-                print(f"  • {feature}: {direction} heart disease risk")
-    
-    # Medical insights
-    top_5_features = feature_importance.head(5)
-    print(f"\nKEY MEDICAL INSIGHTS:")
-    print(f"• Most predictive factor: {top_5_features.iloc[0]['feature']}")
-    
-    positive_factors = feature_importance[feature_importance['coefficient'] > 0].head(3)
-    negative_factors = feature_importance[feature_importance['coefficient'] < 0].head(3)
-    
-    if not positive_factors.empty:
-        print(f"• Top risk increasers: {', '.join(positive_factors['feature'].tolist())}")
-    if not negative_factors.empty:
-        print(f"• Top protective factors: {', '.join(negative_factors['feature'].tolist())}")
-    
-    print(f"\nCLINICAL INTERPRETATION:")
-    print(f"• This model uses the validated Cleveland Heart Disease dataset")
-    print(f"• Features reflect real cardiovascular risk factors")
-    print(f"• Results should align with established medical knowledge")
-    
+
+    # Brief console report
+    head = feature_importance.head(15)
+    logger.info("Top features (by |coefficient|):\n" + head[['feature', 'coefficient', 'odds_ratio']].to_string(index=False))
+
     return feature_importance
 
-def create_visualizations(cm, feature_importance):
+def create_visualizations(cm, feature_importance, y_test=None, y_proba=None):
     """
     Create visualizations for confusion matrix and feature importance
     """
-    print("\nCREATING VISUALIZATIONS")
-    print("-" * 40)
+    logger.info("CREATING VISUALIZATIONS")
     
     # Set up the plotting style
+    os.makedirs('artifacts', exist_ok=True)
     plt.style.use('default')
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    fig, axes = plt.subplots(1, 3 if (y_test is not None and y_proba is not None) else 2, figsize=(21, 6))
+    if isinstance(axes, np.ndarray):
+        ax1 = axes[0]
+        ax2 = axes[1]
+        ax3 = axes[2] if len(axes) > 2 else None
+    else:
+        ax1, ax2 = axes, None
     
     # Confusion Matrix Heatmap
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax1)
@@ -580,128 +438,169 @@ def create_visualizations(cm, feature_importance):
     ax2.set_xlabel('Coefficient Value')
     ax2.set_title('Top 10 Feature Importance')
     ax2.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+
+    # ROC curve (optional third panel)
+    if y_test is not None and y_proba is not None and ax3 is not None:
+        fpr, tpr, _ = roc_curve(y_test, y_proba)
+        ax3.plot(fpr, tpr, label='ROC curve')
+        ax3.plot([0, 1], [0, 1], linestyle='--', color='gray')
+        ax3.set_xlabel('False Positive Rate')
+        ax3.set_ylabel('True Positive Rate')
+        ax3.set_title('ROC Curve')
+        ax3.legend(loc='lower right')
     
     plt.tight_layout()
-    plt.savefig('heart_disease_prediction_results.png', dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    print("Visualizations saved as 'heart_disease_prediction_results.png'")
+    plt.savefig('artifacts/heart_disease_prediction_results.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    logger.info("Visualizations saved under 'artifacts/'")
+
+
+def save_artifacts(pipeline, feature_importance, metrics_dict):
+    """Persist model, preprocessor info, feature importance, and metrics."""
+    os.makedirs('artifacts', exist_ok=True)
+
+    # Model pipeline
+    model_path = os.path.join('artifacts', 'model_pipeline.joblib')
+    joblib.dump(pipeline, model_path)
+
+    # Feature importance
+    fi_path = os.path.join('artifacts', 'feature_importance.csv')
+    feature_importance.to_csv(fi_path, index=False)
+
+    # Metrics with timestamp
+    metrics_path = os.path.join('artifacts', 'metrics.json')
+    payload = {
+        **metrics_dict,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    with open(metrics_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+
+    logger.info(f"Artifacts saved: {model_path}, {fi_path}, {metrics_path}")
 
 def analyze_data_quality(df):
     """
     Analyze Cleveland Heart Disease dataset quality and relationships
     """
-    print("\nCLEVELAND DATASET QUALITY ANALYSIS")
-    print("-" * 40)
+    logger.info("CLEVELAND DATASET QUALITY ANALYSIS")
     
     target_col = 'target' if 'target' in df.columns else 'num'
     
     # Show original distribution if num exists
     if 'num' in df.columns:
-        print("Original disease severity distribution:")
-        print("0 = No disease, 1-4 = Disease severity levels")
-        print(df['num'].value_counts().sort_index())
-        print()
+        logger.info("Original disease severity distribution:")
+        logger.info("0 = No disease, 1-4 = Disease severity levels")
+        logger.info("\n" + str(df['num'].value_counts().sort_index()))
     
     # Analyze Age vs Heart Disease
     if 'age' in df.columns:
-        print("Age vs Heart Disease:")
+        logger.info("Age vs Heart Disease:")
         age_analysis = df.groupby(pd.cut(df['age'], bins=8), observed=True)[target_col].agg(['mean', 'count'])
-        print(age_analysis)
+        logger.info("\n" + str(age_analysis))
     
     # Analyze Chest Pain vs Heart Disease
     if 'cp' in df.columns:
-        print(f"\nChest Pain Type vs Heart Disease:")
-        print("Raw chest pain values:", df['cp'].value_counts().head())
+        logger.info("Chest Pain Type vs Heart Disease:")
+        logger.info("Raw chest pain values: " + str(df['cp'].value_counts().head()))
         # Use actual values since this dataset uses string categories
         cp_analysis = df.groupby('cp')[target_col].agg(['mean', 'count'])
-        print(cp_analysis)
+        logger.info("\n" + str(cp_analysis))
     
     # Analyze Cholesterol vs Heart Disease
     if 'chol' in df.columns:
-        print(f"\nCholesterol vs Heart Disease:")
+        logger.info("Cholesterol vs Heart Disease:")
         # Exclude zero values (missing data)
         chol_data = df[df['chol'] > 0]
         if len(chol_data) > 0:
             chol_analysis = chol_data.groupby(pd.cut(chol_data['chol'], bins=5), observed=True)[target_col].agg(['mean', 'count'])
-            print(chol_analysis)
-        print(f"Zero cholesterol values (missing): {(df['chol'] == 0).sum()}")
+            logger.info("\n" + str(chol_analysis))
+        logger.info(f"Zero cholesterol values (missing): {(df['chol'] == 0).sum()}")
     
     # Analyze Max Heart Rate vs Heart Disease
     if 'thalach' in df.columns:
-        print(f"\nMax Heart Rate vs Heart Disease:")
+        logger.info("Max Heart Rate vs Heart Disease:")
         hr_analysis = df.groupby(pd.cut(df['thalach'], bins=5), observed=True)[target_col].agg(['mean', 'count'])
-        print(hr_analysis)
+        logger.info("\n" + str(hr_analysis))
     
     # Key clinical correlations
     numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
     if target_col in numeric_cols:
-        print(f"\nTop Correlations with Heart Disease:")
+        logger.info("Top Correlations with Heart Disease:")
         correlations = df[numeric_cols].corr()[target_col].abs().sort_values(ascending=False)
-        print(correlations.head(10))
+        logger.info("\n" + str(correlations.head(10)))
     
     # Sample of key medical data
     key_cols = ['age', 'sex', 'cp', 'trestbps', 'chol', 'thalach', 'exang', target_col]
     available_cols = [col for col in key_cols if col in df.columns]
-    print(f"\nSample of key medical data:")
-    print(df[available_cols].head(10))
+    logger.info("Sample of key medical data:\n" + str(df[available_cols].head(10)))
 
 def main():
     """
     Main function to execute the complete Cleveland Heart Disease prediction pipeline
     """
-    print("CLEVELAND HEART DISEASE PREDICTION WITH LOGISTIC REGRESSION")
-    print("=" * 60)
+    logger.info("CLEVELAND HEART DISEASE PREDICTION WITH LOGISTIC REGRESSION")
     
     # Step 1: Download dataset
     dataset_path = download_dataset()
     if not dataset_path:
-        print("ERROR: Cannot proceed without dataset")
+        logger.error("Cannot proceed without dataset")
         return
     
     # Load the dataset
     try:
         df = pd.read_csv(dataset_path)
-        print(f"Dataset loaded successfully: {df.shape}")
+        logger.info(f"Dataset loaded successfully: {df.shape}")
     except Exception as e:
-        print(f"ERROR loading dataset: {e}")
+        logger.exception(f"ERROR loading dataset: {e}")
         return
     
     # Step 2: Explore dataset
     df = explore_dataset(df)
     
     # Step 3: Preprocess data
-    X, y, df_processed = preprocess_data(df)
+    X, y = prepare_features_and_target(df)
     if X is None:
-        print("ERROR: Data preprocessing failed")
+        logger.error("Data preparation failed")
         return
     
     # Step 4: Split and scale data
-    X_train_scaled, X_test_scaled, y_train, y_test, scaler = split_and_scale_data(X, y)
+    X_train, X_test, y_train, y_test = split_data(X, y)
     
     # Step 5: Train model
-    model = train_logistic_regression(X_train_scaled, y_train)
+    pipeline, best_C = build_and_train_pipeline(X_train, y_train)
     
     # Step 6: Make predictions
-    y_pred, y_pred_proba = make_predictions(model, X_test_scaled)
+    y_pred, y_pred_proba = make_predictions(pipeline, X_test)
     
     # Step 7: Evaluate model
-    accuracy, precision, recall, f1, cm = evaluate_model(y_test, y_pred, y_pred_proba)
+    accuracy, precision, recall, f1, cm, extra_metrics = evaluate_model(y_test, y_pred, y_pred_proba)
     
     # Step 8: Analyze feature importance
-    feature_importance = analyze_feature_importance(model, X.columns)
+    feature_importance = analyze_feature_importance(pipeline, X_train)
     
     # Create visualizations
-    create_visualizations(cm, feature_importance)
+    create_visualizations(cm, feature_importance, y_test=y_test, y_proba=y_pred_proba)
+
+    # Save artifacts (model, feature importance, metrics)
+    metrics_payload = {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "best_C": best_C,
+        **extra_metrics,
+    }
+    save_artifacts(pipeline, feature_importance, metrics_payload)
     
     # Final summary
-    print("\n" + "=" * 60)
-    print("PROJECT COMPLETED SUCCESSFULLY!")
-    print("=" * 60)
-    print(f"Model Accuracy: {accuracy:.1%}")
-    print(f"Dataset Size: {df.shape[0]} samples, {df.shape[1]} features")
-    print(f"Most Important Feature: {feature_importance.iloc[0]['feature']}")
-    print("Results visualized and saved")
+    logger.info("=" * 60)
+    logger.info("PROJECT COMPLETED SUCCESSFULLY!")
+    logger.info("=" * 60)
+    logger.info(f"Model Accuracy: {accuracy:.1%}")
+    logger.info(f"Dataset Size: {df.shape[0]} samples, {df.shape[1]} features")
+    logger.info(f"Most Important Feature: {feature_importance.iloc[0]['feature']}")
+    logger.info("Results visualized and saved to 'artifacts/'")
 
     # Analyze data quality
     analyze_data_quality(df)
